@@ -117,7 +117,9 @@ public class NHRJob implements Job {
             CriteriaBuilder cb = entityManager.getCriteriaBuilder();
             CriteriaQuery<NHRInschrijving> cq = cb.createQuery(NHRInschrijving.class);
             Root<NHRInschrijving> from = cq.from(NHRInschrijving.class);
-            cq.where(cb.lessThan(from.get("volgendProberen"), cb.currentTimestamp()));
+
+            // Limit to any tries <20 (above that is considered "soft-failed", and won't be polled on its own)
+            cq.where(cb.and(cb.lessThan(from.get("volgendProberen"), cb.currentTimestamp()), cb.lessThan(from.get("probeerAantal"), 20)));
             List<NHRInschrijving> procList = entityManager.createQuery(cq).setMaxResults(20).getResultList();
             if (procList.isEmpty()) break;
 
@@ -140,7 +142,11 @@ public class NHRJob implements Job {
                     Map<String, String> errors = e.getErrors();
                     if (errors.containsKey("IPD0004") || errors.containsKey("IPD0005")) {
                         failed = false; // KVK nummer cannot be found. We cannot expect this to work after a retry.
+                    } else if (errors.containsKey("IPD9999")) {
+                        failed = true; // Technical error at KVK
                     } else {
+                        // Unknown "temporary" error (e.g. block on the number), take out of sequence
+                        process.setProbeerAantal(Integer.MAX_VALUE);
                         failed = true;
                     }
                     exception = e;
@@ -156,7 +162,12 @@ public class NHRJob implements Job {
                 if (failed) {
                     log.error(String.format("KVK nummer %s ophalen mislukt (%d keer geprobeerd)", process.getKvkNummer(), process.getProbeerAantal()), exception);
                     totalFetchErrorCount += 1;
-                    process.setProbeerAantal(process.getProbeerAantal() + 1);
+                    // Once we hit 20 errors, bail out entirely.
+                    if (process.getProbeerAantal() > 20) {
+                        process.setProbeerAantal(Integer.MAX_VALUE);
+                    } else {
+                        process.setProbeerAantal(process.getProbeerAantal() + 1);
+                    }
                     Calendar time = Calendar.getInstance();
                     process.setLaatstGeprobeerd(new Date());
                     // Wait for 30 seconds, then 1 minute, 2 minutes, 4 minutes, ...
@@ -164,7 +175,10 @@ public class NHRJob implements Job {
 
                     // Make sure that fetches retry at least every two hours.
                     // (This will happen after 9 retries, or two hours in.)
-                    if (secondsUntilNextTry > 7200) {
+                    if (process.getProbeerAantal() > 20) {
+                        // About 1 year
+                        secondsUntilNextTry = 12 * 30 * 24 * 60 * 60;
+                    } else if (secondsUntilNextTry > 7200) {
                         secondsUntilNextTry = 7200;
                     } else if (secondsUntilNextTry < 30) {
                         secondsUntilNextTry = 30;
